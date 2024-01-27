@@ -5,6 +5,7 @@ from operator import attrgetter, or_
 
 from django.db import IntegrityError, connections, models, transaction
 from django.db.models import query_utils, signals, sql
+from django.db.models.utils import BaseCollector
 
 
 class ProtectedError(IntegrityError):
@@ -93,91 +94,10 @@ def get_candidate_relations_to_delete(opts):
     )
 
 
-class Collector:
-    def __init__(self, using, origin=None):
-        self.using = using
-        # A Model or QuerySet object.
-        self.origin = origin
-        # Initially, {model: {instances}}, later values become lists.
-        self.data = defaultdict(set)
-        # {(field, value): [instances, …]}
-        self.field_updates = defaultdict(list)
-        # {model: {field: {instances}}}
-        self.restricted_objects = defaultdict(partial(defaultdict, set))
-        # fast_deletes is a list of queryset-likes that can be deleted without
-        # fetching the objects into memory.
-        self.fast_deletes = []
-
-        # Tracks deletion-order dependency for databases without transactions
-        # or ability to defer constraint checks. Only concrete model classes
-        # should be included, as the dependencies exist only between actual
-        # database tables; proxy models are represented here by their concrete
-        # parent.
-        self.dependencies = defaultdict(set)  # {model: {models}}
-
-    def add(self, objs, source=None, nullable=False, reverse_dependency=False):
-        """
-        Add 'objs' to the collection of objects to be deleted.  If the call is
-        the result of a cascade, 'source' should be the model that caused it,
-        and 'nullable' should be set to True if the relation can be null.
-
-        Return a list of all objects that were not already collected.
-        """
-        if not objs:
-            return []
-        new_objs = []
-        model = objs[0].__class__
-        instances = self.data[model]
-        for obj in objs:
-            if obj not in instances:
-                new_objs.append(obj)
-        instances.update(new_objs)
-        # Nullable relationships can be ignored -- they are nulled out before
-        # deleting, and therefore do not affect the order in which objects have
-        # to be deleted.
-        if source is not None and not nullable:
-            self.add_dependency(source, model, reverse_dependency=reverse_dependency)
-        return new_objs
-
-    def add_dependency(self, model, dependency, reverse_dependency=False):
-        if reverse_dependency:
-            model, dependency = dependency, model
-        self.dependencies[model._meta.concrete_model].add(
-            dependency._meta.concrete_model
-        )
-        self.data.setdefault(dependency, self.data.default_factory())
-
-    def add_field_update(self, field, value, objs):
-        """
-        Schedule a field update. 'objs' must be a homogeneous iterable
-        collection of model instances (e.g. a QuerySet).
-        """
-        self.field_updates[field, value].append(objs)
-
-    def add_restricted_objects(self, field, objs):
-        if objs:
-            model = objs[0].__class__
-            self.restricted_objects[model][field].update(objs)
-
-    def clear_restricted_objects_from_set(self, model, objs):
-        if model in self.restricted_objects:
-            self.restricted_objects[model] = {
-                field: items - objs
-                for field, items in self.restricted_objects[model].items()
-            }
-
-    def clear_restricted_objects_from_queryset(self, model, qs):
-        if model in self.restricted_objects:
-            objs = set(
-                qs.filter(
-                    pk__in=[
-                        obj.pk
-                        for objs in self.restricted_objects[model].values()
-                        for obj in objs
-                    ]
-                )
-            )
-            self.clear_restricted_objects_from_set(model, objs)
+class Collector(BaseCollector):
+    @property
+    def fast_deletes(self):
+        return self.fast_mod_objs
 
     def _has_signal_listeners(self, model):
         return signals.pre_delete.has_listeners(
@@ -229,20 +149,7 @@ class Collector:
         )
 
     def get_del_batches(self, objs, fields):
-        """
-        Return the objs in suitably sized batches for the used connection.
-        """
-        field_names = [field.name for field in fields]
-        conn_batch_size = max(
-            connections[self.using].ops.bulk_batch_size(field_names, objs), 1
-        )
-        if len(objs) > conn_batch_size:
-            return [
-                objs[i : i + conn_batch_size]
-                for i in range(0, len(objs), conn_batch_size)
-            ]
-        else:
-            return [objs]
+        return super().get_obj_batches(objs, fields)
 
     def collect(
         self,
@@ -279,7 +186,7 @@ class Collector:
         can be deleted.
         """
         if self.can_fast_delete(objs):
-            self.fast_deletes.append(objs)
+            self.fast_mod_objs.append(objs)
             return
         new_objs = self.add(
             objs, source, nullable, reverse_dependency=reverse_dependency
@@ -365,7 +272,7 @@ class Collector:
             batches = self.get_del_batches(new_objs, related_fields)
             for batch in batches:
                 sub_objs = self.related_objects(related_model, related_fields, batch)
-                self.fast_deletes.append(sub_objs)
+                self.fast_mod_objs.append(sub_objs)
         for field in model._meta.private_fields:
             if hasattr(field, "bulk_related_objects"):
                 # It's something like generic foreign key.
@@ -379,7 +286,7 @@ class Collector:
             # candidates for deletion also collected via CASCADE.
             for related_model, instances in self.data.items():
                 self.clear_restricted_objects_from_set(related_model, instances)
-            for qs in self.fast_deletes:
+            for qs in self.fast_mod_objs:
                 self.clear_restricted_objects_from_queryset(qs.model, qs)
             if self.restricted_objects.values():
                 restricted_objects = defaultdict(list)
@@ -399,39 +306,6 @@ class Collector:
                         ),
                         set(chain.from_iterable(restricted_objects.values())),
                     )
-
-    def related_objects(self, related_model, related_fields, objs):
-        """
-        Get a QuerySet of the related model to objs via related fields.
-        """
-        predicate = query_utils.Q.create(
-            [(f"{related_field.name}__in", objs) for related_field in related_fields],
-            connector=query_utils.Q.OR,
-        )
-        return related_model._base_manager.using(self.using).filter(predicate)
-
-    def instances_with_model(self):
-        for model, instances in self.data.items():
-            for obj in instances:
-                yield model, obj
-
-    def sort(self):
-        sorted_models = []
-        concrete_models = set()
-        models = list(self.data)
-        while len(sorted_models) < len(models):
-            found = False
-            for model in models:
-                if model in sorted_models:
-                    continue
-                dependencies = self.dependencies.get(model._meta.concrete_model)
-                if not (dependencies and dependencies.difference(concrete_models)):
-                    sorted_models.append(model)
-                    concrete_models.add(model._meta.concrete_model)
-                    found = True
-            if not found:
-                return
-        self.data = {model: self.data[model] for model in sorted_models}
 
     def delete(self):
         # sort instance collections
@@ -468,7 +342,7 @@ class Collector:
                     )
 
             # fast deletes
-            for qs in self.fast_deletes:
+            for qs in self.fast_mod_objs:
                 count = qs._raw_delete(using=self.using)
                 if count:
                     deleted_counter[qs.model._meta.label] += count
