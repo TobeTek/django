@@ -34,7 +34,7 @@ def CASCADE(collector, field, sub_objs, using):
 
 def PROTECT(collector, field, sub_objs, using):
     raise ProtectedError(
-        "Cannot delete some instances of model '%s' because they are "
+        "Cannot modify (delete/update) some instances of model '%s' because they are "
         "referenced through a protected foreign key: '%s.%s'"
         % (
             field.remote_field.model.__name__,
@@ -53,17 +53,17 @@ def RESTRICT(collector, field, sub_objs, using):
 def SET(value):
     if callable(value):
 
-        def set_on_delete(collector, field, sub_objs, using):
+        def set_on_modify(collector, field, sub_objs, using):
             collector.add_field_update(field, value(), sub_objs)
 
     else:
 
-        def set_on_delete(collector, field, sub_objs, using):
+        def set_on_modify(collector, field, sub_objs, using):
             collector.add_field_update(field, value, sub_objs)
 
-    set_on_delete.deconstruct = lambda: ("django.db.models.SET", (value,), {})
-    set_on_delete.lazy_sub_objs = True
-    return set_on_delete
+    set_on_modify.deconstruct = lambda: ("django.db.models.SET", (value,), {})
+    set_on_modify.lazy_sub_objs = True
+    return set_on_modify
 
 
 def SET_NULL(collector, field, sub_objs, using):
@@ -94,7 +94,7 @@ def get_candidate_relations_to_delete(opts):
     )
 
 
-class Collector(BaseCollector):
+class DeleteCollector(BaseCollector):
     @property
     def fast_deletes(self):
         return self.fast_mod_objs

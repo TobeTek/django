@@ -1,6 +1,8 @@
 import functools
 from abc import ABC, abstractmethod
-from collections import namedtuple
+from collections import namedtuple, defaultdict
+from django.db.models import query_utils, signals, sql
+from django.db import IntegrityError, connections, models, transaction
 
 
 def make_model_tuple(model):
@@ -93,11 +95,18 @@ class BaseCollector(ABC):
         # parent.
         self.dependencies = defaultdict(set)  # {model: {models}}
 
-    def add(self, objs, source=None, nullable=False, reverse_dependency=False):
+    def add(
+        self,
+        objs,
+        source=None,
+        nullable=False,
+        reverse_dependency=False,
+        ignore_new_records=False,
+    ):
         """
-        Add 'objs' to the collection of objects to be modified (deleted/updated).  If the call is
-        the result of a cascade, 'source' should be the model that caused it,
-        and 'nullable' should be set to True if the relation can be null.
+        Add 'objs' to the collection of objects to be modified (deleted/updated).
+        If the call is the result of a cascade, 'source' should be the model that
+        caused it, and 'nullable' should be set to True if the relation can be null.
 
         Return a list of all objects that were not already collected.
         """
@@ -108,6 +117,8 @@ class BaseCollector(ABC):
         instances = self.data[model]
         for obj in objs:
             if obj not in instances:
+                if ignore_new_records and obj._state.adding:
+                    continue
                 new_objs.append(obj)
         instances.update(new_objs)
         # Nullable relationships can be ignored -- they are nulled out before
@@ -171,7 +182,7 @@ class BaseCollector(ABC):
         )
         if len(objs) > conn_batch_size:
             return [
-                objs[i: i + conn_batch_size]
+                objs[i : i + conn_batch_size]
                 for i in range(0, len(objs), conn_batch_size)
             ]
         else:

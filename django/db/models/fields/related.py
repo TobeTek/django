@@ -11,7 +11,7 @@ from django.db import connection, router
 from django.db.backends import utils
 from django.db.models import Q
 from django.db.models.constants import LOOKUP_SEP
-from django.db.models.deletion import CASCADE, SET_DEFAULT, SET_NULL
+from django.db.models.deletion import CASCADE, SET_DEFAULT, SET_NULL, DO_NOTHING
 from django.db.models.query_utils import PathInfo
 from django.db.models.utils import make_model_tuple
 from django.utils.deprecation import RemovedInDjango60Warning
@@ -534,6 +534,7 @@ class ForeignObject(RelatedField):
         on_delete,
         from_fields,
         to_fields,
+        on_update,
         rel=None,
         related_name=None,
         related_query_name=None,
@@ -551,6 +552,7 @@ class ForeignObject(RelatedField):
                 limit_choices_to=limit_choices_to,
                 parent_link=parent_link,
                 on_delete=on_delete,
+                on_update=on_update
             )
 
         super().__init__(

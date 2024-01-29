@@ -48,6 +48,7 @@ class ForeignObjectRel(FieldCacheMixin):
         limit_choices_to=None,
         parent_link=False,
         on_delete=None,
+        on_update=None,
     ):
         self.field = field
         self.model = to
@@ -56,6 +57,7 @@ class ForeignObjectRel(FieldCacheMixin):
         self.limit_choices_to = {} if limit_choices_to is None else limit_choices_to
         self.parent_link = parent_link
         self.on_delete = on_delete
+        self.on_update = on_update
 
         self.symmetrical = False
         self.multiple = True
@@ -147,6 +149,7 @@ class ForeignObjectRel(FieldCacheMixin):
             make_hashable(self.limit_choices_to),
             self.parent_link,
             self.on_delete,
+            self.on_update,
             self.symmetrical,
             self.multiple,
         )
@@ -280,6 +283,7 @@ class ManyToOneRel(ForeignObjectRel):
         limit_choices_to=None,
         parent_link=False,
         on_delete=None,
+        on_update=None,
     ):
         super().__init__(
             field,
