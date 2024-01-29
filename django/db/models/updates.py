@@ -8,83 +8,7 @@ from django.db.models import query_utils, signals, sql
 from django.db.models.utils import BaseCollector
 
 
-class ProtectedError(IntegrityError):
-    def __init__(self, msg, protected_objects):
-        self.protected_objects = protected_objects
-        super().__init__(msg, protected_objects)
-
-
-class RestrictedError(IntegrityError):
-    def __init__(self, msg, restricted_objects):
-        self.restricted_objects = restricted_objects
-        super().__init__(msg, restricted_objects)
-
-
-def CASCADE(collector, field, sub_objs, using):
-    collector.collect(
-        sub_objs,
-        source=field.remote_field.model,
-        source_attr=field.name,
-        nullable=field.null,
-        fail_on_restricted=False,
-    )
-    if field.null and not connections[using].features.can_defer_constraint_checks:
-        collector.add_field_update(field, None, sub_objs)
-
-
-def PROTECT(collector, field, sub_objs, using):
-    raise ProtectedError(
-        "Cannot modify (delete/update) some instances of model '%s' because they are "
-        "referenced through a protected foreign key: '%s.%s'"
-        % (
-            field.remote_field.model.__name__,
-            sub_objs[0].__class__.__name__,
-            field.name,
-        ),
-        sub_objs,
-    )
-
-
-def RESTRICT(collector, field, sub_objs, using):
-    collector.add_restricted_objects(field, sub_objs)
-    collector.add_dependency(field.remote_field.model, field.model)
-
-
-def SET(value):
-    if callable(value):
-
-        def set_on_modify(collector, field, sub_objs, using):
-            collector.add_field_update(field, value(), sub_objs)
-
-    else:
-
-        def set_on_modify(collector, field, sub_objs, using):
-            collector.add_field_update(field, value, sub_objs)
-
-    set_on_modify.deconstruct = lambda: ("django.db.models.SET", (value,), {})
-    set_on_modify.lazy_sub_objs = True
-    return set_on_modify
-
-
-def SET_NULL(collector, field, sub_objs, using):
-    collector.add_field_update(field, None, sub_objs)
-
-
-SET_NULL.lazy_sub_objs = True
-
-
-def SET_DEFAULT(collector, field, sub_objs, using):
-    collector.add_field_update(field, field.get_default(), sub_objs)
-
-
-SET_DEFAULT.lazy_sub_objs = True
-
-
-def DO_NOTHING(collector, field, sub_objs, using):
-    pass
-
-
-def get_candidate_relations_to_delete(opts):
+def get_candidate_relations_to_update(opts):
     # The candidate relations are the ones that come from N-1 and 1-1 relations.
     # N-N  (i.e., many-to-many) relations aren't candidates for deletion.
     return (
@@ -94,20 +18,20 @@ def get_candidate_relations_to_delete(opts):
     )
 
 
-class DeleteCollector(BaseCollector):
+class UpdateCollector(BaseCollector):
     @property
-    def fast_deletes(self):
+    def fast_updates(self):
         return self.fast_mod_objs
 
     def _has_signal_listeners(self, model):
-        return signals.pre_delete.has_listeners(
+        return signals.pre_save.has_listeners(model) or signals.post_save.has_listeners(
             model
-        ) or signals.post_delete.has_listeners(model)
+        )
 
-    def can_fast_delete(self, objs, from_field=None):
+    def can_fast_update(self, objs, from_field=None):
         """
         Determine if the objects in the given queryset-like or single object
-        can be fast-deleted. This can be done if there are no cascades, no
+        can be fast-updated. This can be done if there are no cascades, no
         parents and no signal listeners for the object class.
 
         The 'from_field' tells where we are coming from - we need this to
@@ -115,11 +39,13 @@ class DeleteCollector(BaseCollector):
         skipping parent -> child -> parent chain preventing fast delete of
         the child.
         """
-        if from_field and from_field.remote_field.on_delete is not CASCADE:
+        from django.db.models.deletion import CASCADE, DO_NOTHING
+
+        if from_field and from_field.remote_field.on_update is not CASCADE:
             return False
         if hasattr(objs, "_meta"):
             model = objs._meta.model
-        elif hasattr(objs, "model") and hasattr(objs, "_raw_delete"):
+        elif hasattr(objs, "model") and hasattr(objs, "update"):
             model = objs.model
         else:
             return False
@@ -136,8 +62,8 @@ class DeleteCollector(BaseCollector):
             and
             # Foreign keys pointing to this model.
             all(
-                related.field.remote_field.on_delete is DO_NOTHING
-                for related in get_candidate_relations_to_delete(opts)
+                related.field.remote_field.on_update is DO_NOTHING
+                for related in get_candidate_relations_to_update(opts)
             )
             and (
                 # Something like generic foreign key.
@@ -148,7 +74,7 @@ class DeleteCollector(BaseCollector):
             )
         )
 
-    def get_del_batches(self, objs, fields):
+    def get_update_batches(self, objs, fields):
         return super().get_obj_batches(objs, fields)
 
     def collect(
@@ -185,11 +111,23 @@ class DeleteCollector(BaseCollector):
         may need to collect more objects to determine whether restricted ones
         can be deleted.
         """
-        if self.can_fast_delete(objs):
+        from django.db.models.deletion import (
+            CASCADE,
+            DO_NOTHING,
+            PROTECT,
+            ProtectedError,
+            RestrictedError,
+        )
+
+        if self.can_fast_update(objs):
             self.fast_mod_objs.append(objs)
             return
         new_objs = self.add(
-            objs, source, nullable, reverse_dependency=reverse_dependency
+            objs,
+            source,
+            nullable,
+            reverse_dependency=reverse_dependency,
+            ignore_new_records=True,
         )
         if not new_objs:
             return
@@ -216,21 +154,21 @@ class DeleteCollector(BaseCollector):
 
         if keep_parents:
             parents = set(model._meta.get_parent_list())
-        model_fast_deletes = defaultdict(list)
+        model_fast_updates = defaultdict(list)
         protected_objects = defaultdict(list)
-        for related in get_candidate_relations_to_delete(model._meta):
+        for related in get_candidate_relations_to_update(model._meta):
             # Preserve parent reverse relationships if keep_parents=True.
             if keep_parents and related.model in parents:
                 continue
             field = related.field
-            on_delete = field.remote_field.on_delete
-            if on_delete == DO_NOTHING:
+            on_update = field.remote_field.on_update
+            if on_update == DO_NOTHING:
                 continue
             related_model = related.related_model
-            if self.can_fast_delete(related_model, from_field=field):
-                model_fast_deletes[related_model].append(field)
+            if self.can_fast_update(related_model, from_field=field):
+                model_fast_updates[related_model].append(field)
                 continue
-            batches = self.get_del_batches(new_objs, [field])
+            batches = self.get_obj_batches(new_objs, [field])
             for batch in batches:
                 sub_objs = self.related_objects(related_model, [field], batch)
                 # Non-referenced fields can be deferred if no signal receivers
@@ -246,21 +184,21 @@ class DeleteCollector(BaseCollector):
                     referenced_fields = set(
                         chain.from_iterable(
                             (rf.attname for rf in rel.field.foreign_related_fields)
-                            for rel in get_candidate_relations_to_delete(
+                            for rel in get_candidate_relations_to_update(
                                 related_model._meta
                             )
                         )
                     )
                     sub_objs = sub_objs.only(*tuple(referenced_fields))
-                if getattr(on_delete, "lazy_sub_objs", False) or sub_objs:
+                if getattr(on_update, "lazy_sub_objs", False) or sub_objs:
                     try:
-                        on_delete(self, field, sub_objs, self.using)
+                        on_update(self, field, sub_objs, self.using)
                     except ProtectedError as error:
                         key = "'%s.%s'" % (field.model.__name__, field.name)
                         protected_objects[key] += error.protected_objects
         if protected_objects:
             raise ProtectedError(
-                "Cannot delete some instances of model %r because they are "
+                "Cannot update some instances of model %r because they are "
                 "referenced through protected foreign keys: %s."
                 % (
                     model.__name__,
@@ -268,8 +206,8 @@ class DeleteCollector(BaseCollector):
                 ),
                 set(chain.from_iterable(protected_objects.values())),
             )
-        for related_model, related_fields in model_fast_deletes.items():
-            batches = self.get_del_batches(new_objs, related_fields)
+        for related_model, related_fields in model_fast_updates.items():
+            batches = self.get_obj_batches(new_objs, related_fields)
             for batch in batches:
                 sub_objs = self.related_objects(related_model, related_fields, batch)
                 self.fast_mod_objs.append(sub_objs)
@@ -307,7 +245,7 @@ class DeleteCollector(BaseCollector):
                         set(chain.from_iterable(restricted_objects.values())),
                     )
 
-    def delete(self):
+    def update(self):
         # sort instance collections
         for model, instances in self.data.items():
             self.data[model] = sorted(instances, key=attrgetter("pk"))
@@ -316,36 +254,36 @@ class DeleteCollector(BaseCollector):
         # don't support transactions or cannot defer constraint checks until the
         # end of a transaction.
         self.sort()
-        # number of objects deleted for each model label
-        deleted_counter = Counter()
+        # number of objects updated for each model label
+        update_counter = Counter()
 
         # Optimize for the case with a single obj and no dependencies
         if len(self.data) == 1 and len(instances) == 1:
             instance = list(instances)[0]
-            if self.can_fast_delete(instance):
+            if self.can_fast_update(instance):
                 with transaction.mark_for_rollback_on_error(self.using):
-                    count = sql.DeleteQuery(model).delete_batch(
-                        [instance.pk], self.using
+                    count = sql.UpdateQuery(model).update_batch(
+                        [instance.pk], using=self.using
                     )
                 setattr(instance, model._meta.pk.attname, None)
                 return count, {model._meta.label: count}
 
         with transaction.atomic(using=self.using, savepoint=False):
-            # send pre_delete signals
+            # send pre_save signals
             for model, obj in self.instances_with_model():
                 if not model._meta.auto_created:
-                    signals.pre_delete.send(
+                    signals.pre_save.send(
                         sender=model,
                         instance=obj,
                         using=self.using,
                         origin=self.origin,
                     )
 
-            # fast deletes
+            # fast updates
             for qs in self.fast_mod_objs:
-                count = qs._raw_delete(using=self.using)
+                count = qs._update(using=self.using)
                 if count:
-                    deleted_counter[qs.model._meta.label] += count
+                    update_counter[qs.model._meta.label] += count
 
             # update fields
             for (field, value), instances_list in self.field_updates.items():
@@ -373,17 +311,17 @@ class DeleteCollector(BaseCollector):
             for instances in self.data.values():
                 instances.reverse()
 
-            # delete instances
+            # update instances
             for model, instances in self.data.items():
-                query = sql.DeleteQuery(model)
+                query = sql.UpdateQuery(model)
                 pk_list = [obj.pk for obj in instances]
-                count = query.delete_batch(pk_list, self.using)
+                count = query.update_batch(pk_list, self.using)
                 if count:
-                    deleted_counter[model._meta.label] += count
+                    update_counter[model._meta.label] += count
 
                 if not model._meta.auto_created:
                     for obj in instances:
-                        signals.post_delete.send(
+                        signals.post_save.send(
                             sender=model,
                             instance=obj,
                             using=self.using,
@@ -393,4 +331,4 @@ class DeleteCollector(BaseCollector):
         for model, instances in self.data.items():
             for instance in instances:
                 setattr(instance, model._meta.pk.attname, None)
-        return sum(deleted_counter.values()), dict(deleted_counter)
+        return sum(update_counter.values()), dict(update_counter)

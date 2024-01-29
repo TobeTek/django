@@ -29,7 +29,8 @@ from django.db import (
 from django.db.models import NOT_PROVIDED, ExpressionWrapper, IntegerField, Max, Value
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.constraints import CheckConstraint, UniqueConstraint
-from django.db.models.deletion import CASCADE, Collector
+from django.db.models.deletion import CASCADE, Collector as DeletionCollector
+from django.db.models.updates import UpdateCollector
 from django.db.models.expressions import RawSQL
 from django.db.models.fields.related import (
     ForeignObjectRel,
@@ -981,6 +982,9 @@ class Model(AltersData, metaclass=ModelBase):
                 using,
                 update_fields,
             )
+
+        # TODO: Trigger cascades
+            
         # Store the database on which the object was saved
         self._state.db = using
         # Once saved, this is no longer a to-be-added instance.
